@@ -2,11 +2,14 @@ package services
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"io/ioutil"
 	"log"
+	"math/rand"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"sync"
@@ -36,21 +39,33 @@ const (
 	Pause   = "暂停"
 	Running = "监听中"
 
-	DefaultIntervalSeconds = 3
-	staggerDelay           = 150 * time.Millisecond
-	blockedBackoff         = 5 * time.Second
+	DefaultIntervalSeconds = 8
+	staggerDelay           = 1800 * time.Millisecond
+	baseBlockedBackoff     = 130 * time.Second
+	maxBlockedBackoff      = 300 * time.Second
 )
 
 // IntervalOptions 用户可选的轮询间隔档位(秒)。
-// 1s 偏激进,容易触发 Apple 限流;>=3s 是常见安全档位;30/60s 适合长期挂机。
-var IntervalOptions = []int{1, 3, 5, 10, 30, 60}
+var IntervalOptions = []int{8, 10, 5, 20, 30, 60}
 
 // IntervalLabel 把秒数转成下拉框显示文案。
 func IntervalLabel(seconds int) string {
-	if seconds == DefaultIntervalSeconds {
-		return fmt.Sprintf("%d 秒 (默认)", seconds)
+	switch seconds {
+	case 8:
+		return "8 秒 (推荐默认 - 平稳不风控)"
+	case 10:
+		return "10 秒 (稳健安全档)"
+	case 5:
+		return "5 秒 (极速档 - 偶尔易限流)"
+	case 20:
+		return "20 秒 (低频安全)"
+	case 30:
+		return "30 秒 (长期挂机)"
+	case 60:
+		return "60 秒 (超低频)"
+	default:
+		return fmt.Sprintf("%d 秒", seconds)
 	}
-	return fmt.Sprintf("%d 秒", seconds)
 }
 
 // IntervalLabels 生成下拉框完整选项列表。
@@ -72,11 +87,63 @@ func ParseIntervalLabel(label string) int {
 	return DefaultIntervalSeconds
 }
 
+type BarkLevelOption struct {
+	Label string
+	Level string
+	Sound string
+	Call  int
+}
+
+var BarkLevelOptions = []BarkLevelOption{
+	{
+		Label: "时效性通知 (锁屏置顶/穿透勿扰/警报音)",
+		Level: "timeSensitive",
+		Sound: "alarm",
+		Call:  0,
+	},
+	{
+		Label: "紧急重要警告 (静音也强制响铃)",
+		Level: "critical",
+		Sound: "alarm",
+		Call:  0,
+	},
+	{
+		Label: "持续强警报 (类似电话持续响铃30秒)",
+		Level: "critical",
+		Sound: "alarm",
+		Call:  1,
+	},
+	{
+		Label: "普通通知 (系统默认提示音/温和)",
+		Level: "active",
+		Sound: "",
+		Call:  0,
+	},
+}
+
+func BarkLevelLabels() []string {
+	labels := make([]string, 0, len(BarkLevelOptions))
+	for _, opt := range BarkLevelOptions {
+		labels = append(labels, opt.Label)
+	}
+	return labels
+}
+
+func GetBarkLevelOption(labelOrKey string) BarkLevelOption {
+	for _, opt := range BarkLevelOptions {
+		if opt.Label == labelOrKey || opt.Level == labelOrKey {
+			return opt
+		}
+	}
+	return BarkLevelOptions[0]
+}
+
 var Listen = listenService{
 	items:           map[string]ListenItem{},
 	Status:          binding.NewString(),
 	Area:            model.Areas[0],
 	Logs:            widget.NewLabel(""),
+	BarkLevel:       BarkLevelOptions[0].Label,
 	IntervalSeconds: binding.NewInt(),
 }
 
@@ -87,6 +154,7 @@ type listenService struct {
 	Area            model.Area
 	Logs            *widget.Label
 	BarkNotifyUrl   string
+	BarkLevel       string
 	IntervalSeconds binding.Int
 }
 
@@ -99,13 +167,13 @@ type ListenItem struct {
 
 func (s *listenService) IntervalDuration() time.Duration {
 	seconds, err := s.IntervalSeconds.Get()
-	if err != nil || seconds <= 0 {
+	if err != nil || seconds < 5 {
 		seconds = DefaultIntervalSeconds
 	}
 	return time.Duration(seconds) * time.Second
 }
 
-func (s *listenService) Add(areaTitle string, storeTitle string, productTitle string, barkNotifyUrl string) {
+func (s *listenService) Add(areaTitle string, storeTitle string, productTitle string, barkNotifyUrl string, barkLevel ...string) {
 	store := Store.GetStore(areaTitle, storeTitle)
 	product := Product.GetProduct(areaTitle, productTitle)
 
@@ -120,6 +188,9 @@ func (s *listenService) Add(areaTitle string, storeTitle string, productTitle st
 		}
 	}
 	s.BarkNotifyUrl = barkNotifyUrl
+	if len(barkLevel) > 0 && barkLevel[0] != "" {
+		s.BarkLevel = barkLevel[0]
+	}
 	s.updateLogStrLocked()
 	s.mu.Unlock()
 }
@@ -186,6 +257,7 @@ func (s *listenService) Run() {
 
 	go func() {
 		const idleSleep = 200 * time.Millisecond
+		var consecutiveBlocks int
 
 		for {
 			stats, ok := s.Status.Get()
@@ -196,6 +268,7 @@ func (s *listenService) Run() {
 			s.mu.RUnlock()
 
 			if !running || itemCount == 0 {
+				consecutiveBlocks = 0
 				time.Sleep(idleSleep)
 				continue
 			}
@@ -207,30 +280,20 @@ func (s *listenService) Run() {
 			var inStockBagURL string
 			var inStockMsg string
 
-			for key, item := range s.items {
-				status, ok := result.skus[item.Store.StoreNumber+"."+item.Product.Code]
-				if !ok {
-					if result.blockedStores[item.Store.StoreNumber] {
-						s.updateStatusLocked(key, StatusBlocked)
-					} else if item.Status == "" {
-						s.updateStatusLocked(key, StatusWait)
-					}
-					continue
-				}
-
-				if status {
-					s.updateStatusLocked(key, StatusInStock)
-					s.Status.Set(Pause)
-
+			for _, item := range s.items {
+				if strings.HasPrefix(item.Status, StatusInStock) {
 					inStockBagURL = fmt.Sprintf("%s/shop/bag", s.Area.ShopOrigin())
-					inStockMsg = fmt.Sprintf("%s %s 有货", item.Store.CityStoreName, item.Product.Title)
+					if item.Store.IsAllStores() && item.Status != StatusInStock {
+						storeName := strings.TrimPrefix(item.Status, StatusInStock+": ")
+						inStockMsg = fmt.Sprintf("%s (%s) %s 有货", item.Store.CityStoreName, storeName, item.Product.Title)
+					} else {
+						inStockMsg = fmt.Sprintf("%s %s 有货", item.Store.CityStoreName, item.Product.Title)
+					}
 					hasInStock = true
+					s.Status.Set(Pause)
 					break
 				}
-				s.updateStatusLocked(key, StatusOutStock)
 			}
-
-			s.updateLogStrLocked()
 			s.mu.Unlock()
 
 			if hasInStock {
@@ -241,36 +304,70 @@ func (s *listenService) Run() {
 					Content: inStockMsg,
 				})
 				go s.AlertMp3()
-				go s.SendPushNotificationByBark("有货提醒", inStockMsg, inStockBagURL)
+				barkBody := inStockMsg + "\n⚡️ 点击通知直接进入官网购物车结算！"
+				go s.SendPushNotificationByBark("🎉 Apple Store 有货提醒", barkBody, inStockBagURL)
 			}
 
 			if result.blocked {
 				resetShopSession()
-				time.Sleep(blockedBackoff)
+				consecutiveBlocks++
+				backoff := baseBlockedBackoff * time.Duration(consecutiveBlocks)
+				if backoff > maxBlockedBackoff {
+					backoff = maxBlockedBackoff
+				}
+				log.Printf("[风控拦截] Apple/CDN 频率限制 (541), 正在进入冷却等待 %v (第 %d 次重试)... CDN 解禁窗口需 >120 秒\n", backoff, consecutiveBlocks)
+
+				s.mu.Lock()
+				statusLabel := fmt.Sprintf("风控冷却(%ds)", int(backoff.Seconds()))
+				for key, item := range s.items {
+					if result.blockedStores[item.Store.StoreNumber] || item.Status == StatusWait || item.Status == StatusBlocked {
+						s.updateStatusLocked(key, statusLabel)
+					}
+				}
+				s.updateLogStrLocked()
+				s.mu.Unlock()
+
+				time.Sleep(backoff)
 				continue
 			}
 
-			time.Sleep(s.IntervalDuration())
+			// 正常成功，重置连续限流计数
+			consecutiveBlocks = 0
+
+			// 轮询间隔休眠，附加 0~500ms 随机抖动打破固定周期特征
+			jitter := time.Duration(rand.Intn(500)) * time.Millisecond
+			time.Sleep(s.IntervalDuration() + jitter)
 		}
 	}()
 }
 
 type skuFetch struct {
-	storeNumber string
-	skus        map[string]bool
-	blocked     bool
+	storeNumber    string
+	skus           map[string]bool
+	inStockDetails map[string]string
+	blocked        bool
+	empty          bool
 }
 
 type storeFetchResult struct {
-	skus          map[string]bool
-	blockedStores map[string]bool
-	blocked       bool
+	skus           map[string]bool
+	inStockDetails map[string]string
+	blockedStores  map[string]bool
+	blocked        bool
+}
+
+type queryBatchTarget struct {
+	key      string
+	location string
+	storeNum string
+	items    []ListenItem
 }
 
 func (s *listenService) groupByStore() storeFetchResult {
 	result := storeFetchResult{
-		skus:          map[string]bool{},
-		blockedStores: map[string]bool{},
+		skus:           map[string]bool{},
+		inStockDetails: map[string]string{},
+		blockedStores:  map[string]bool{},
 	}
 
 	defer func() {
@@ -280,35 +377,122 @@ func (s *listenService) groupByStore() storeFetchResult {
 	}()
 
 	s.mu.RLock()
-	group := map[string][]ListenItem{}
+	// 智能合并：同一城市/Location 的多个具体门店或全城虚拟门店，合并为 1 个 location 请求
+	targetMap := map[string]*queryBatchTarget{}
+	targetOrder := []string{}
+
 	for _, item := range s.items {
-		group[item.Store.StoreNumber] = append(group[item.Store.StoreNumber], item)
+		var targetKey string
+		if item.Store.Location != "" {
+			targetKey = "LOC:" + item.Store.Location
+		} else {
+			targetKey = "STORE:" + item.Store.StoreNumber
+		}
+
+		if tgt, exists := targetMap[targetKey]; exists {
+			tgt.items = append(tgt.items, item)
+		} else {
+			tgt := &queryBatchTarget{
+				key:      targetKey,
+				location: item.Store.Location,
+				storeNum: item.Store.StoreNumber,
+				items:    []ListenItem{item},
+			}
+			targetMap[targetKey] = tgt
+			targetOrder = append(targetOrder, targetKey)
+		}
 	}
 	area := s.Area
 	s.mu.RUnlock()
 
-	count := len(group)
+	count := len(targetOrder)
 	if count < 1 {
 		return result
 	}
 
-	idx := 0
-	for storeNumber, items := range group {
+	sort.Strings(targetOrder)
+
+	for idx, targetKey := range targetOrder {
+		tgt := targetMap[targetKey]
 		if idx > 0 {
 			time.Sleep(staggerDelay)
 		}
-		idx++
-		link := s.fulfillmentURL(storeNumber, items)
-		referer := productBuyURL(area, items[0].Product)
-		part := s.fetchSku(storeNumber, link, referer)
+
+		// 检查监听状态，若暂停则中止
+		stats, ok := s.Status.Get()
+		if ok != nil || stats != Running {
+			break
+		}
+
+		referer := fmt.Sprintf("%s/shop/buy-iphone", area.ShopOrigin())
+		var part skuFetch
+
+		if tgt.location != "" {
+			link := s.locationURL(tgt.location, tgt.items)
+			part = s.fetchLocation(tgt.location, link, referer, tgt.items)
+			if part.empty && !part.blocked {
+				// 若 location 查询未返回门店（如部分境外无 location 接口），自动降级为单店查询
+				for _, it := range tgt.items {
+					storeLink := s.fulfillmentURL(it.Store.StoreNumber, []ListenItem{it})
+					singlePart := s.fetchSku(it.Store.StoreNumber, storeLink, referer)
+					if singlePart.blocked {
+						part.blocked = true
+						break
+					}
+					for k, v := range singlePart.skus {
+						part.skus[k] = v
+					}
+				}
+			}
+		} else {
+			link := s.fulfillmentURL(tgt.storeNum, tgt.items)
+			part = s.fetchSku(tgt.storeNum, link, referer)
+		}
+
 		if part.blocked {
 			result.blocked = true
-			if part.storeNumber != "" {
-				result.blockedStores[part.storeNumber] = true
+			for _, it := range tgt.items {
+				result.blockedStores[it.Store.StoreNumber] = true
+			}
+			break
+		}
+
+		// 实时更新当前批次对应的各商品最新状态到界面
+		s.mu.Lock()
+		for key, item := range s.items {
+			uniqKey := item.Store.StoreNumber + "." + item.Product.Code
+			if avail, found := part.skus[uniqKey]; found {
+				if avail {
+					if detail, hasDetail := part.inStockDetails[uniqKey]; hasDetail && detail != "" {
+						s.updateStatusLocked(key, StatusInStock+": "+detail)
+					} else {
+						s.updateStatusLocked(key, StatusInStock)
+					}
+				} else {
+					s.updateStatusLocked(key, StatusOutStock)
+				}
 			}
 		}
+		s.updateLogStrLocked()
+		s.mu.Unlock()
+
 		for key, v := range part.skus {
 			result.skus[key] = v
+		}
+		for key, v := range part.inStockDetails {
+			result.inStockDetails[key] = v
+		}
+
+		// 如果有商品有货，立即停止本轮剩余查询
+		hasInStockThisBatch := false
+		for _, avail := range part.skus {
+			if avail {
+				hasInStockThisBatch = true
+				break
+			}
+		}
+		if hasInStockThisBatch {
+			break
 		}
 	}
 
@@ -318,8 +502,7 @@ func (s *listenService) groupByStore() storeFetchResult {
 func (s *listenService) fulfillmentURL(storeNumber string, items []ListenItem) string {
 	var b strings.Builder
 	b.WriteString(s.Area.ShopOrigin())
-	b.WriteString("/shop/retail/pickup-message?little=true&store=")
-	b.WriteString(storeNumber)
+	b.WriteString("/shop/retail/pickup-message?pl=true")
 
 	for index, item := range items {
 		b.WriteString("&parts.")
@@ -327,32 +510,10 @@ func (s *listenService) fulfillmentURL(storeNumber string, items []ListenItem) s
 		b.WriteByte('=')
 		b.WriteString(item.Product.Code)
 	}
+	b.WriteString("&store=")
+	b.WriteString(storeNumber)
 
 	return b.String()
-}
-
-func familyPath(familyType string) string {
-	switch familyType {
-	case "iphone18pro", "iphone18promax":
-		return "iphone-18-pro"
-	case "iphoneduo":
-		return "iphone-duo"
-	case "iphone17pro", "iphone17promax":
-		return "iphone-17-pro"
-	case "iphoneair":
-		return "iphone-air"
-	case "iphone17":
-		return "iphone-17"
-	default:
-		if strings.HasPrefix(familyType, "iphone") {
-			return "iphone-" + strings.TrimPrefix(familyType, "iphone")
-		}
-		return familyType
-	}
-}
-
-func productBuyURL(area model.Area, product model.Product) string {
-	return fmt.Sprintf("%s/shop/buy-iphone/%s/%s", area.ShopOrigin(), familyPath(product.Type), strings.ToLower(product.Code))
 }
 
 func fulfillmentAvailable(availability gjson.Result) bool {
@@ -365,20 +526,187 @@ func fulfillmentAvailable(availability gjson.Result) bool {
 	return availability.Get("messageTypes.compact.storeSelectionEnabled").Bool()
 }
 
-func (s *listenService) fetchSku(storeNumber string, skUrl string, referer string) skuFetch {
+func normalizeLocation(loc string) string {
+	loc = strings.TrimSpace(loc)
+	switch {
+	case strings.Contains(loc, "北京"):
+		return "100000"
+	case strings.Contains(loc, "上海"):
+		return "200000"
+	case strings.Contains(loc, "广州"):
+		return "510000"
+	case strings.Contains(loc, "深圳"):
+		return "518000"
+	case strings.Contains(loc, "成都"):
+		return "610051"
+	case strings.Contains(loc, "天津"):
+		return "300000"
+	case strings.Contains(loc, "重庆"):
+		return "400000"
+	case strings.Contains(loc, "南京"):
+		return "210000"
+	case strings.Contains(loc, "杭州"):
+		return "310000"
+	case strings.Contains(loc, "沈阳"):
+		return "110011"
+	case strings.Contains(loc, "大连"):
+		return "116001"
+	case strings.Contains(loc, "昆明"):
+		return "650031"
+	case strings.Contains(loc, "合肥"):
+		return "230031"
+	case strings.Contains(loc, "济南"):
+		return "250011"
+	case strings.Contains(loc, "青岛"):
+		return "266000"
+	case strings.Contains(loc, "武汉"):
+		return "430000"
+	case strings.Contains(loc, "长沙"):
+		return "410000"
+	case strings.Contains(loc, "厦门"):
+		return "361000"
+	case strings.Contains(loc, "福州"):
+		return "350000"
+	case strings.Contains(loc, "郑州"):
+		return "450000"
+	case strings.Contains(loc, "南宁"):
+		return "530022"
+	case strings.Contains(loc, "无锡"):
+		return "214000"
+	case strings.Contains(loc, "苏州"):
+		return "215000"
+	case strings.Contains(loc, "宁波"):
+		return "315000"
+	case strings.Contains(loc, "温州"):
+		return "325000"
+	default:
+		return loc
+	}
+}
+
+func (s *listenService) locationURL(location string, items []ListenItem) string {
+	var b strings.Builder
+	b.WriteString(s.Area.ShopOrigin())
+	b.WriteString("/shop/retail/pickup-message?pl=true")
+
+	// 收集去重后的 product codes 并排序保证 URL 稳定性
+	codeSet := map[string]bool{}
+	for _, item := range items {
+		codeSet[item.Product.Code] = true
+	}
+	codes := make([]string, 0, len(codeSet))
+	for code := range codeSet {
+		codes = append(codes, code)
+	}
+	sort.Strings(codes)
+
+	for idx, code := range codes {
+		b.WriteString("&parts.")
+		b.WriteString(strconv.Itoa(idx))
+		b.WriteByte('=')
+		b.WriteString(code)
+	}
+	b.WriteString("&location=")
+	b.WriteString(url.QueryEscape(normalizeLocation(location)))
+
+	return b.String()
+}
+
+func (s *listenService) fetchLocation(location string, skUrl string, referer string, items []ListenItem) skuFetch {
 	result := skuFetch{
-		storeNumber: storeNumber,
-		skus:        map[string]bool{},
+		skus:           map[string]bool{},
+		inStockDetails: map[string]string{},
 	}
 
 	warmupShopPage(referer, s.Area.AcceptLanguage())
 
 	resp, err := shopHTTP().R().
-		SetHeader("accept", "*/*").
+		SetHeader("accept", "application/json, text/javascript, */*; q=0.01").
 		SetHeader("accept-language", s.Area.AcceptLanguage()).
 		SetHeader("cache-control", "no-cache").
 		SetHeader("pragma", "no-cache").
 		SetHeader("referer", referer).
+		SetHeader("x-requested-with", "XMLHttpRequest").
+		SetHeader("sec-fetch-dest", "empty").
+		SetHeader("sec-fetch-mode", "cors").
+		SetHeader("sec-fetch-site", "same-origin").
+		Get(skUrl)
+	if err != nil {
+		log.Println(err)
+		return result
+	}
+
+	body := resp.String()
+	log.Println(resp.GetStatusCode(), skUrl)
+
+	if resp.GetStatusCode() == 541 || resp.GetStatusCode() >= 400 {
+		result.blocked = true
+		resetShopSession()
+		preview := body
+		if len(preview) > 160 {
+			preview = preview[:160]
+		}
+		log.Println("fulfillment location blocked", preview)
+		return result
+	}
+
+	stores := gjson.Get(body, "body.stores")
+	if !stores.Exists() || stores.Get("#").Int() == 0 {
+		stores = gjson.Get(body, "body.content.pickupMessage.stores")
+	}
+	if !stores.Exists() || stores.Get("#").Int() == 0 {
+		result.empty = true
+		log.Println("fulfillment location no stores found for", location)
+		return result
+	}
+
+	inStockStores := map[string][]string{}
+
+	for _, store := range stores.Array() {
+		sn := store.Get("storeNumber").String()
+		sname := store.Get("storeName").String()
+		for productCode, availability := range store.Get("partsAvailability").Map() {
+			uniqKey := fmt.Sprintf("%s.%s", sn, productCode)
+			avail := fulfillmentAvailable(availability)
+			result.skus[uniqKey] = avail
+			if avail {
+				inStockStores[productCode] = append(inStockStores[productCode], sname)
+			}
+		}
+	}
+
+	// 针对虚拟“全部/任意门店”任务项
+	for _, it := range items {
+		if it.Store.IsAllStores() {
+			allKey := it.Store.StoreNumber + "." + it.Product.Code
+			if names, ok := inStockStores[it.Product.Code]; ok && len(names) > 0 {
+				result.skus[allKey] = true
+				result.inStockDetails[allKey] = strings.Join(names, "、")
+			} else {
+				result.skus[allKey] = false
+			}
+		}
+	}
+
+	return result
+}
+
+func (s *listenService) fetchSku(storeNumber string, skUrl string, referer string) skuFetch {
+	result := skuFetch{
+		storeNumber:    storeNumber,
+		skus:           map[string]bool{},
+		inStockDetails: map[string]string{},
+	}
+
+	warmupShopPage(referer, s.Area.AcceptLanguage())
+
+	resp, err := shopHTTP().R().
+		SetHeader("accept", "application/json, text/javascript, */*; q=0.01").
+		SetHeader("accept-language", s.Area.AcceptLanguage()).
+		SetHeader("cache-control", "no-cache").
+		SetHeader("pragma", "no-cache").
+		SetHeader("referer", referer).
+		SetHeader("x-requested-with", "XMLHttpRequest").
 		SetHeader("sec-fetch-dest", "empty").
 		SetHeader("sec-fetch-mode", "cors").
 		SetHeader("sec-fetch-site", "same-origin").
@@ -473,17 +801,96 @@ func (s *listenService) AlertMp3() {
 	<-done
 }
 
-func (s *listenService) SendPushNotificationByBark(title string, content string, bagUrl string) {
+// formatBarkEndpoint 格式化用户填写的 Bark 地址或设备 Key 为规范的推送 API 地址。
+func formatBarkEndpoint(raw string) string {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return ""
+	}
+	// 用户只填写了 key
+	if !strings.HasPrefix(raw, "http://") && !strings.HasPrefix(raw, "https://") {
+		return "https://api.day.app/" + raw
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return strings.TrimRight(raw, "/")
+	}
+	// 去掉多余路径（例如用户直接复制了带测试文案的地址如 api.day.app/key/内容）
+	parts := strings.Split(strings.Trim(u.Path, "/"), "/")
+	if len(parts) > 0 && parts[0] != "" {
+		if strings.Contains(u.Host, "day.app") {
+			u.Path = "/" + parts[0]
+			u.RawQuery = ""
+			return u.String()
+		}
+	}
+	return strings.TrimRight(raw, "/")
+}
 
-	if len(s.BarkNotifyUrl) <= 0 {
+// BarkPayload Bark 推送数据结构
+type BarkPayload struct {
+	Title    string `json:"title"`
+	Body     string `json:"body"`
+	URL      string `json:"url"`
+	Group    string `json:"group,omitempty"`
+	Sound    string `json:"sound,omitempty"`
+	Level    string `json:"level,omitempty"`
+	Call     int    `json:"call,omitempty"`
+	Icon     string `json:"icon,omitempty"`
+	Badge    int    `json:"badge,omitempty"`
+	AutoCopy int    `json:"autoCopy,omitempty"`
+	Copy     string `json:"copy,omitempty"`
+}
+
+func (s *listenService) SendPushNotificationByBark(title string, content string, bagUrl string) {
+	endpoint := formatBarkEndpoint(s.BarkNotifyUrl)
+	if endpoint == "" {
 		return
 	}
 
-	apiUrl := fmt.Sprintf("%s/%s/%s?url=%s", strings.TrimRight(s.BarkNotifyUrl, "/"), title, content, bagUrl)
+	opt := GetBarkLevelOption(s.BarkLevel)
 
-	response, err := http.Get(apiUrl)
-	if err != nil {
-		panic(err)
+	payload := BarkPayload{
+		Title:    title,
+		Body:     content,
+		URL:      bagUrl,
+		Group:    "Apple Store 预约",
+		Icon:     "https://www.apple.com.cn/favicon.ico",
+		Sound:    opt.Sound,
+		Level:    opt.Level,
+		Call:     opt.Call,
+		Badge:    1,
+		AutoCopy: 1,      // 收到推送时自动复制链接
+		Copy:     bagUrl, // 备用：剪贴板直接带有官网购物车直达链接
 	}
-	defer response.Body.Close()
+
+	data, err := json.Marshal(payload)
+	if err != nil {
+		log.Printf("[Bark 推送失败] 序列化失败: %v\n", err)
+		return
+	}
+
+	client := &http.Client{
+		Timeout: 10 * time.Second,
+	}
+
+	req, err := http.NewRequest(http.MethodPost, endpoint, bytes.NewBuffer(data))
+	if err != nil {
+		log.Printf("[Bark 推送失败] 创建请求失败: %v\n", err)
+		return
+	}
+	req.Header.Set("Content-Type", "application/json; charset=utf-8")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		log.Printf("[Bark 推送失败] 发送失败: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		log.Printf("[Bark 推送失败] HTTP 状态码异常: %d\n", resp.StatusCode)
+		return
+	}
+	log.Printf("[Bark 推送成功] 目标: %s, 跳转链接: %s\n", endpoint, bagUrl)
 }

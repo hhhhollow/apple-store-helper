@@ -6,6 +6,8 @@ import (
 	"apple-store-helper/theme"
 	"apple-store-helper/view"
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -36,7 +38,16 @@ func main() {
 
 	// Bark 通知输入框
 	barkWidget := widget.NewEntry()
-	barkWidget.SetPlaceHolder("https://api.day.app/你的BarkKey")
+	barkWidget.SetPlaceHolder("https://api.day.app/你的BarkKey 或 直接输入Key")
+	barkWidget.OnChanged = func(val string) {
+		services.Listen.BarkNotifyUrl = val
+	}
+
+	// Bark 提醒级别选择器 (Bark Level Selector)
+	barkLevelWidget := widget.NewSelect(services.BarkLevelLabels(), func(val string) {
+		services.Listen.BarkLevel = val
+	})
+	barkLevelWidget.SetSelected(services.BarkLevelOptions[0].Label)
 
 	// 查询频率选择器 (Polling Interval Selector)
 	intervalWidget := widget.NewSelect(services.IntervalLabels(), func(val string) {
@@ -68,7 +79,7 @@ func main() {
 3. 点击“开始”按钮开始监听，检测到有货时会自动打开购物车页面
 `
 
-	loadUserSettingsCache(areaWidget, storeWidget, productWidget, barkWidget, intervalWidget)
+	loadUserSettingsCache(areaWidget, storeWidget, productWidget, barkWidget, barkLevelWidget, intervalWidget)
 
 	// 初始化 GUI 窗口内容 (Initialize GUI)
 	view.Window.SetContent(container.NewVBox(
@@ -78,9 +89,10 @@ func main() {
 		container.New(layout.NewFormLayout(), widget.NewLabel("选择型号:"), productWidget),
 		container.New(layout.NewFormLayout(), widget.NewLabel("查询频率:"), intervalWidget),
 		container.New(layout.NewFormLayout(), widget.NewLabel("Bark 通知地址:"), barkWidget),
+		container.New(layout.NewFormLayout(), widget.NewLabel("Bark 提醒级别:"), barkLevelWidget),
 
 		container.NewBorder(nil, nil,
-			createActionButtons(areaWidget, storeWidget, productWidget, barkWidget, intervalWidget),
+			createActionButtons(areaWidget, storeWidget, productWidget, barkWidget, barkLevelWidget, intervalWidget),
 			createControlButtons(),
 		),
 
@@ -109,7 +121,7 @@ func initFyneApp() {
 }
 
 // 加载用户设置缓存 (Load user settings cache)
-func loadUserSettingsCache(areaWidget *widget.RadioGroup, storeWidget *widget.Select, productWidget *widget.Select, barkNotifyWidget *widget.Entry, intervalWidget *widget.Select) {
+func loadUserSettingsCache(areaWidget *widget.RadioGroup, storeWidget *widget.Select, productWidget *widget.Select, barkNotifyWidget *widget.Entry, barkLevelWidget *widget.Select, intervalWidget *widget.Select) {
 	settings, err := services.LoadSettings()
 	interval := services.DefaultIntervalSeconds
 	if err == nil {
@@ -118,11 +130,23 @@ func loadUserSettingsCache(areaWidget *widget.RadioGroup, storeWidget *widget.Se
 		productWidget.SetSelected(settings.SelectedProduct)
 		services.Listen.SetListenItems(settings.ListenItems)
 		barkNotifyWidget.SetText(settings.BarkNotifyUrl)
-		if settings.ListenInterval > 0 {
+		services.Listen.BarkNotifyUrl = settings.BarkNotifyUrl
+		if settings.BarkLevel != "" {
+			barkLevelWidget.SetSelected(settings.BarkLevel)
+			services.Listen.BarkLevel = settings.BarkLevel
+		} else {
+			barkLevelWidget.SetSelected(services.BarkLevelOptions[0].Label)
+			services.Listen.BarkLevel = services.BarkLevelOptions[0].Label
+		}
+		if settings.ListenInterval >= 5 {
 			interval = settings.ListenInterval
+		} else {
+			interval = services.DefaultIntervalSeconds
 		}
 	} else {
 		areaWidget.SetSelected(services.Listen.Area.Title)
+		barkLevelWidget.SetSelected(services.BarkLevelOptions[0].Label)
+		services.Listen.BarkLevel = services.BarkLevelOptions[0].Label
 	}
 
 	services.Listen.IntervalSeconds.Set(interval)
@@ -130,18 +154,19 @@ func loadUserSettingsCache(areaWidget *widget.RadioGroup, storeWidget *widget.Se
 }
 
 // 创建动作按钮 (Create action buttons)
-func createActionButtons(areaWidget *widget.RadioGroup, storeWidget *widget.Select, productWidget *widget.Select, barkNotifyWidget *widget.Entry, intervalWidget *widget.Select) *fyne.Container {
+func createActionButtons(areaWidget *widget.RadioGroup, storeWidget *widget.Select, productWidget *widget.Select, barkNotifyWidget *widget.Entry, barkLevelWidget *widget.Select, intervalWidget *widget.Select) *fyne.Container {
 	return container.NewHBox(
 		widget.NewButton("添加", func() {
 			if storeWidget.Selected == "" || productWidget.Selected == "" {
 				dialog.ShowError(errors.New("请选择门店和型号"), view.Window)
 			} else {
-				services.Listen.Add(areaWidget.Selected, storeWidget.Selected, productWidget.Selected, barkNotifyWidget.Text)
+				services.Listen.Add(areaWidget.Selected, storeWidget.Selected, productWidget.Selected, barkNotifyWidget.Text, barkLevelWidget.Selected)
 				services.SaveSettings(services.UserSettings{
 					SelectedArea:    areaWidget.Selected,
 					SelectedStore:   storeWidget.Selected,
 					SelectedProduct: productWidget.Selected,
 					BarkNotifyUrl:   barkNotifyWidget.Text,
+					BarkLevel:       barkLevelWidget.Selected,
 					ListenInterval:  services.ParseIntervalLabel(intervalWidget.Selected),
 					ListenItems:     services.Listen.GetListenItems(),
 				})
@@ -156,7 +181,18 @@ func createActionButtons(areaWidget *widget.RadioGroup, storeWidget *widget.Sele
 		}),
 		widget.NewButton("测试 Bark 通知", func() {
 			services.Listen.BarkNotifyUrl = barkNotifyWidget.Text
-			services.Listen.SendPushNotificationByBark("有货提醒（测试）", "此为测试提醒，点击通知将跳转到相关链接", "https://www.apple.com.cn/shop/bag")
+			services.Listen.BarkLevel = barkLevelWidget.Selected
+			if strings.TrimSpace(barkNotifyWidget.Text) == "" {
+				dialog.ShowInformation("提示", "请先输入 Bark 通知地址或 Key", view.Window)
+				return
+			}
+			bagURL := fmt.Sprintf("%s/shop/bag", services.Listen.Area.ShopOrigin())
+			go services.Listen.SendPushNotificationByBark(
+				"🎉【测试】Apple Store 预约助手",
+				fmt.Sprintf("收到此通知说明 Bark 配置成功！\n当前提醒级别: %s\n⚡️ 点击本条通知将直接跳转到 Apple 官网购物车购买。", barkLevelWidget.Selected),
+				bagURL,
+			)
+			dialog.ShowInformation("Bark 推送已发送", "测试通知已向手机发送，请在 iPhone 上查收并点击通知测试是否能打开官网购物车。", view.Window)
 		}),
 	)
 }

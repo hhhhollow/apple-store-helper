@@ -31,16 +31,42 @@ func (s *storeService) ByArea(area model.Area) []model.Store {
 
 		localeStores := []model.Store{}
 
+		type cityGroup struct {
+			displayName string
+			location    string
+			count       int
+		}
+		groups := map[string]*cityGroup{}
+
 		if hasStates {
 			for _, state := range v.Get("state").Array() {
+				stateName := state.Get("name").String()
 				for _, store := range state.Get("store").Array() {
-					stateName := store.Get("address.stateName").String()
+					stateAddr := store.Get("address.stateName").String()
+					if stateAddr == "" {
+						stateAddr = stateName
+					}
 					city := store.Get("address.city").String()
+					loc := strings.TrimSpace(stateAddr + " " + city)
 					localeStores = append(localeStores, model.Store{
 						StoreNumber:   store.Get("id").String(),
-						CityStoreName: fmt.Sprintf("%s-%s", stateName, store.Get("name").String()),
-						Location:      strings.TrimSpace(stateName + " " + city),
+						CityStoreName: fmt.Sprintf("%s-%s", stateAddr, store.Get("name").String()),
+						Location:      loc,
 					})
+
+					displayName := stateAddr
+					if stateAddr != city && city != "" {
+						displayName = fmt.Sprintf("%s-%s", stateAddr, city)
+					}
+					if g, ok := groups[loc]; ok {
+						g.count++
+					} else {
+						groups[loc] = &cityGroup{
+							displayName: displayName,
+							location:    loc,
+							count:       1,
+						}
+					}
 				}
 			}
 		} else {
@@ -51,15 +77,39 @@ func (s *storeService) ByArea(area model.Area) []model.Store {
 					CityStoreName: fmt.Sprintf("%s-%s", city, store.Get("name").String()),
 					Location:      city,
 				})
+				if g, ok := groups[city]; ok {
+					g.count++
+				} else {
+					groups[city] = &cityGroup{
+						displayName: city,
+						location:    city,
+						count:       1,
+					}
+				}
 			}
 		}
 
-		// 去重
+		// 去重具体门店
 		localeStores = funk.UniqBy(localeStores, func(x model.Store) string {
 			return x.StoreNumber
 		}).([]model.Store)
 
-		s.stores[locale] = localeStores
+		// 聚合生成各城市/区域的“全部/任意门店”虚拟 Store
+		var allStores []model.Store
+		for loc, g := range groups {
+			if g.count >= 2 || (locale == "zh_CN" && g.location != "") {
+				allStores = append(allStores, model.Store{
+					StoreNumber:   model.AllStoresPrefix + g.displayName,
+					CityStoreName: fmt.Sprintf("%s - [全部/任意门店]", g.displayName),
+					Location:      loc,
+				})
+			}
+		}
+		sort.Slice(allStores, func(i, j int) bool {
+			return allStores[i].CityStoreName < allStores[j].CityStoreName
+		})
+
+		s.stores[locale] = append(allStores, localeStores...)
 	}
 
 	return s.stores[area.Locale]
@@ -67,18 +117,36 @@ func (s *storeService) ByArea(area model.Area) []model.Store {
 
 func (s *storeService) ByAreaTitleForOptions(areaTitle string) []string {
 	area := Area.GetArea(areaTitle)
-	areas := funk.Get(s.ByArea(area), "CityStoreName").([]string)
-	sort.Strings(areas)
-	return areas
+	allList := s.ByArea(area)
+
+	var virtualOptions []string
+	var regularOptions []string
+
+	for _, store := range allList {
+		if store.IsAllStores() {
+			virtualOptions = append(virtualOptions, store.CityStoreName)
+		} else {
+			regularOptions = append(regularOptions, store.CityStoreName)
+		}
+	}
+
+	sort.Strings(virtualOptions)
+	sort.Strings(regularOptions)
+
+	return append(virtualOptions, regularOptions...)
 }
 
 func (s *storeService) GetStore(areaTitle string, storeTitle string) model.Store {
 	code := Area.Title2Code(areaTitle)
 	s.ensureLoaded(code)
 
-	return funk.Find(s.stores[code], func(x model.Store) bool {
+	found := funk.Find(s.stores[code], func(x model.Store) bool {
 		return x.CityStoreName == storeTitle
-	}).(model.Store)
+	})
+	if found == nil {
+		return model.Store{CityStoreName: storeTitle}
+	}
+	return found.(model.Store)
 }
 
 func (s *storeService) GetByNumber(locale string, storeNumber string) model.Store {
