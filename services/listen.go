@@ -9,6 +9,7 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"fyne.io/fyne/v2"
@@ -30,27 +31,63 @@ const (
 	StatusOutStock = "无货"
 	StatusInStock  = "有货"
 	StatusWait     = "等待"
+	StatusBlocked  = "风控重试"
 
 	Pause   = "暂停"
 	Running = "监听中"
 
-	pollInterval   = 1500 * time.Millisecond
-	blockedBackoff = 5 * time.Second
+	DefaultIntervalSeconds = 3
+	staggerDelay           = 150 * time.Millisecond
+	blockedBackoff         = 5 * time.Second
 )
 
+// IntervalOptions 用户可选的轮询间隔档位(秒)。
+// 1s 偏激进,容易触发 Apple 限流;>=3s 是常见安全档位;30/60s 适合长期挂机。
+var IntervalOptions = []int{1, 3, 5, 10, 30, 60}
+
+// IntervalLabel 把秒数转成下拉框显示文案。
+func IntervalLabel(seconds int) string {
+	if seconds == DefaultIntervalSeconds {
+		return fmt.Sprintf("%d 秒 (默认)", seconds)
+	}
+	return fmt.Sprintf("%d 秒", seconds)
+}
+
+// IntervalLabels 生成下拉框完整选项列表。
+func IntervalLabels() []string {
+	labels := make([]string, 0, len(IntervalOptions))
+	for _, s := range IntervalOptions {
+		labels = append(labels, IntervalLabel(s))
+	}
+	return labels
+}
+
+// ParseIntervalLabel 把下拉框选中的文案反解成秒数;无法识别时回退到默认值。
+func ParseIntervalLabel(label string) int {
+	for _, s := range IntervalOptions {
+		if IntervalLabel(s) == label {
+			return s
+		}
+	}
+	return DefaultIntervalSeconds
+}
+
 var Listen = listenService{
-	items:  map[string]ListenItem{},
-	Status: binding.NewString(),
-	Area:   model.Areas[0],
-	Logs:   widget.NewLabel(""),
+	items:           map[string]ListenItem{},
+	Status:          binding.NewString(),
+	Area:            model.Areas[0],
+	Logs:            widget.NewLabel(""),
+	IntervalSeconds: binding.NewInt(),
 }
 
 type listenService struct {
-	items         map[string]ListenItem
-	Status        binding.String
-	Area          model.Area
-	Logs          *widget.Label
-	BarkNotifyUrl string
+	mu              sync.RWMutex
+	items           map[string]ListenItem
+	Status          binding.String
+	Area            model.Area
+	Logs            *widget.Label
+	BarkNotifyUrl   string
+	IntervalSeconds binding.Int
 }
 
 type ListenItem struct {
@@ -60,13 +97,21 @@ type ListenItem struct {
 	Time    carbon.DateTime
 }
 
-func (s *listenService) Add(areaTitle string, storeTitle string, productTitle string, barkNotifyUrl string) {
+func (s *listenService) IntervalDuration() time.Duration {
+	seconds, err := s.IntervalSeconds.Get()
+	if err != nil || seconds <= 0 {
+		seconds = DefaultIntervalSeconds
+	}
+	return time.Duration(seconds) * time.Second
+}
 
+func (s *listenService) Add(areaTitle string, storeTitle string, productTitle string, barkNotifyUrl string) {
 	store := Store.GetStore(areaTitle, storeTitle)
 	product := Product.GetProduct(areaTitle, productTitle)
 
 	uniqKey := store.StoreNumber + "." + product.Code
 
+	s.mu.Lock()
 	if s.items[uniqKey].Store.StoreNumber == "" {
 		s.items[uniqKey] = ListenItem{
 			Store:   store,
@@ -74,105 +119,159 @@ func (s *listenService) Add(areaTitle string, storeTitle string, productTitle st
 			Status:  StatusWait,
 		}
 	}
-
 	s.BarkNotifyUrl = barkNotifyUrl
-	s.UpdateLogStr()
+	s.updateLogStrLocked()
+	s.mu.Unlock()
 }
 
 func (s *listenService) Clean() {
+	s.mu.Lock()
 	s.items = map[string]ListenItem{}
-	s.UpdateLogStr()
+	s.updateLogStrLocked()
+	s.mu.Unlock()
 }
 
 func (s *listenService) SetListenItems(items map[string]ListenItem) {
+	s.mu.Lock()
 	s.items = items
-	s.UpdateLogStr()
+	s.updateLogStrLocked()
+	s.mu.Unlock()
 }
 
 func (s *listenService) GetListenItems() map[string]ListenItem {
-	return s.items
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	res := make(map[string]ListenItem, len(s.items))
+	for k, v := range s.items {
+		res[k] = v
+	}
+	return res
 }
 
-func (s *listenService) UpdateLogStr() {
+func (s *listenService) updateLogStrLocked() {
 	var str string
-
 	for _, item := range s.items {
-
 		str += fmt.Sprintf(
-			"[%s] %s %s %s %s",
+			"[%s] %s %s %s\n",
 			item.Status,
 			item.Time,
 			item.Store.CityStoreName,
 			item.Product.Title,
-			"\n",
 		)
 	}
-
 	s.Logs.SetText(str)
 }
 
-func (s *listenService) UpdateStatus(uniqKey string, status string) {
+func (s *listenService) UpdateLogStr() {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	s.updateLogStrLocked()
+}
+
+func (s *listenService) updateStatusLocked(uniqKey string, status string) {
 	item := s.items[uniqKey]
 	item.Time = carbon.DateTime{Carbon: carbon.Now(carbon.Shanghai)}
 	item.Status = status
 	s.items[uniqKey] = item
 }
 
+func (s *listenService) UpdateStatus(uniqKey string, status string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.updateStatusLocked(uniqKey, status)
+}
+
 func (s *listenService) Run() {
 	s.Status.Set(Pause)
 
 	go func() {
+		const idleSleep = 200 * time.Millisecond
+
 		for {
-			if stats, ok := s.Status.Get(); ok == nil && stats == Running && len(s.items) > 0 {
-				result := s.groupByStore()
+			stats, ok := s.Status.Get()
+			running := ok == nil && stats == Running
 
-				for key, item := range s.items {
-					status, ok := result.skus[item.Store.StoreNumber+"."+item.Product.Code]
-					if !ok {
-						if item.Status == "" {
-							s.UpdateStatus(key, StatusWait)
-						}
-						continue
-					}
+			s.mu.RLock()
+			itemCount := len(s.items)
+			s.mu.RUnlock()
 
-					if status {
-						s.UpdateStatus(key, StatusInStock)
-						s.Status.Set(Pause)
-
-						var bagUrl = fmt.Sprintf("%s/shop/bag", s.Area.ShopOrigin())
-						s.openBrowser(bagUrl)
-						msg := fmt.Sprintf("%s %s 有货", item.Store.CityStoreName, item.Product.Title)
-						dialog.ShowInformation("匹配成功", msg, view.Window)
-						view.App.SendNotification(&fyne.Notification{
-							Title:   "有货提醒",
-							Content: msg,
-						})
-						go s.AlertMp3()
-						go s.SendPushNotificationByBark("有货提醒", msg, bagUrl)
-						break
-					}
-					s.UpdateStatus(key, StatusOutStock)
-				}
-
-				s.UpdateLogStr()
-				if result.blocked {
-					time.Sleep(blockedBackoff)
-					continue
-				}
+			if !running || itemCount == 0 {
+				time.Sleep(idleSleep)
+				continue
 			}
 
-			time.Sleep(pollInterval)
+			result := s.groupByStore()
+
+			s.mu.Lock()
+			hasInStock := false
+			var inStockBagURL string
+			var inStockMsg string
+
+			for key, item := range s.items {
+				status, ok := result.skus[item.Store.StoreNumber+"."+item.Product.Code]
+				if !ok {
+					if result.blockedStores[item.Store.StoreNumber] {
+						s.updateStatusLocked(key, StatusBlocked)
+					} else if item.Status == "" {
+						s.updateStatusLocked(key, StatusWait)
+					}
+					continue
+				}
+
+				if status {
+					s.updateStatusLocked(key, StatusInStock)
+					s.Status.Set(Pause)
+
+					inStockBagURL = fmt.Sprintf("%s/shop/bag", s.Area.ShopOrigin())
+					inStockMsg = fmt.Sprintf("%s %s 有货", item.Store.CityStoreName, item.Product.Title)
+					hasInStock = true
+					break
+				}
+				s.updateStatusLocked(key, StatusOutStock)
+			}
+
+			s.updateLogStrLocked()
+			s.mu.Unlock()
+
+			if hasInStock {
+				s.openBrowser(inStockBagURL)
+				dialog.ShowInformation("匹配成功", inStockMsg, view.Window)
+				view.App.SendNotification(&fyne.Notification{
+					Title:   "有货提醒",
+					Content: inStockMsg,
+				})
+				go s.AlertMp3()
+				go s.SendPushNotificationByBark("有货提醒", inStockMsg, inStockBagURL)
+			}
+
+			if result.blocked {
+				resetShopSession()
+				time.Sleep(blockedBackoff)
+				continue
+			}
+
+			time.Sleep(s.IntervalDuration())
 		}
 	}()
 }
 
 type skuFetch struct {
-	skus    map[string]bool
-	blocked bool
+	storeNumber string
+	skus        map[string]bool
+	blocked     bool
 }
 
-func (s *listenService) groupByStore() skuFetch {
-	result := skuFetch{skus: map[string]bool{}}
+type storeFetchResult struct {
+	skus          map[string]bool
+	blockedStores map[string]bool
+	blocked       bool
+}
+
+func (s *listenService) groupByStore() storeFetchResult {
+	result := storeFetchResult{
+		skus:          map[string]bool{},
+		blockedStores: map[string]bool{},
+	}
 
 	defer func() {
 		if r := recover(); r != nil {
@@ -180,27 +279,33 @@ func (s *listenService) groupByStore() skuFetch {
 		}
 	}()
 
+	s.mu.RLock()
 	group := map[string][]ListenItem{}
 	for _, item := range s.items {
 		group[item.Store.StoreNumber] = append(group[item.Store.StoreNumber], item)
 	}
+	area := s.Area
+	s.mu.RUnlock()
 
 	count := len(group)
 	if count < 1 {
 		return result
 	}
 
-	ch := make(chan skuFetch, count)
+	idx := 0
 	for storeNumber, items := range group {
+		if idx > 0 {
+			time.Sleep(staggerDelay)
+		}
+		idx++
 		link := s.fulfillmentURL(storeNumber, items)
-		referer := productBuyURL(s.Area, items[0].Product)
-		go s.getSkuByLink(ch, link, referer)
-	}
-
-	for i := 0; i < count; i++ {
-		part := <-ch
+		referer := productBuyURL(area, items[0].Product)
+		part := s.fetchSku(storeNumber, link, referer)
 		if part.blocked {
 			result.blocked = true
+			if part.storeNumber != "" {
+				result.blockedStores[part.storeNumber] = true
+			}
 		}
 		for key, v := range part.skus {
 			result.skus[key] = v
@@ -260,8 +365,11 @@ func fulfillmentAvailable(availability gjson.Result) bool {
 	return availability.Get("messageTypes.compact.storeSelectionEnabled").Bool()
 }
 
-func (s *listenService) getSkuByLink(ch chan skuFetch, skUrl string, referer string) {
-	result := skuFetch{skus: map[string]bool{}}
+func (s *listenService) fetchSku(storeNumber string, skUrl string, referer string) skuFetch {
+	result := skuFetch{
+		storeNumber: storeNumber,
+		skus:        map[string]bool{},
+	}
 
 	warmupShopPage(referer, s.Area.AcceptLanguage())
 
@@ -277,8 +385,7 @@ func (s *listenService) getSkuByLink(ch chan skuFetch, skUrl string, referer str
 		Get(skUrl)
 	if err != nil {
 		log.Println(err)
-		ch <- result
-		return
+		return result
 	}
 
 	body := resp.String()
@@ -286,14 +393,12 @@ func (s *listenService) getSkuByLink(ch chan skuFetch, skUrl string, referer str
 
 	if resp.GetStatusCode() == 541 || resp.GetStatusCode() >= 400 {
 		result.blocked = true
-		resetShopSession()
 		preview := body
 		if len(preview) > 160 {
 			preview = preview[:160]
 		}
 		log.Println("fulfillment blocked", preview)
-		ch <- result
-		return
+		return result
 	}
 
 	stores := gjson.Get(body, "body.stores")
@@ -306,8 +411,7 @@ func (s *listenService) getSkuByLink(ch chan skuFetch, skUrl string, referer str
 			preview = preview[:200]
 		}
 		log.Println("fulfillment unexpected body", preview)
-		ch <- result
-		return
+		return result
 	}
 
 	for _, store := range stores.Array() {
@@ -317,7 +421,7 @@ func (s *listenService) getSkuByLink(ch chan skuFetch, skUrl string, referer str
 		}
 	}
 
-	ch <- result
+	return result
 }
 
 // 型号对应预约地址
