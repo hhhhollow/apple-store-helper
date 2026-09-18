@@ -39,30 +39,36 @@ const (
 	Pause   = "暂停"
 	Running = "监听中"
 
-	DefaultIntervalSeconds = 8
+	DefaultIntervalSeconds = 10
 	staggerDelay           = 1800 * time.Millisecond
-	baseBlockedBackoff     = 130 * time.Second
-	maxBlockedBackoff      = 300 * time.Second
+	baseBlockedBackoff     = 210 * time.Second
+	maxBlockedBackoff      = 420 * time.Second
+	microBreakThreshold    = 25
+	microBreakDuration     = 35 * time.Second
+	warmupProbationRounds  = 3
+	warmupInterval         = 35 * time.Second
 )
 
 // IntervalOptions 用户可选的轮询间隔档位(秒)。
-var IntervalOptions = []int{8, 10, 5, 20, 30, 60}
+var IntervalOptions = []int{10, 15, 8, 20, 30, 60}
 
 // IntervalLabel 把秒数转成下拉框显示文案。
 func IntervalLabel(seconds int) string {
 	switch seconds {
-	case 8:
-		return "8 秒 (推荐默认 - 平稳不风控)"
 	case 10:
-		return "10 秒 (稳健安全档)"
+		return "10 秒 (推荐默认 - 均衡低风控)"
+	case 15:
+		return "15 秒 (高稳健 - 极少风控)"
+	case 8:
+		return "8 秒 (快速档 - 易遇频控)"
 	case 5:
-		return "5 秒 (极速档 - 偶尔易限流)"
+		return "5 秒 (极速冲刺 - 短期高危)"
 	case 20:
-		return "20 秒 (低频安全)"
+		return "20 秒 (低频稳妥)"
 	case 30:
 		return "30 秒 (长期挂机)"
 	case 60:
-		return "60 秒 (超低频)"
+		return "60 秒 (超低频挂机)"
 	default:
 		return fmt.Sprintf("%d 秒", seconds)
 	}
@@ -258,6 +264,8 @@ func (s *listenService) Run() {
 	go func() {
 		const idleSleep = 200 * time.Millisecond
 		var consecutiveBlocks int
+		var continuousSuccessCount int
+		var warmupRoundsLeft int
 
 		for {
 			stats, ok := s.Status.Get()
@@ -269,8 +277,35 @@ func (s *listenService) Run() {
 
 			if !running || itemCount == 0 {
 				consecutiveBlocks = 0
+				continuousSuccessCount = 0
+				warmupRoundsLeft = 0
 				time.Sleep(idleSleep)
 				continue
+			}
+
+			// 主动防疲劳微休息：连续正常成功轮询达到阈值时，主动插入短暂休眠，避免触碰 Apple 源站滑动窗口配额
+			if continuousSuccessCount >= microBreakThreshold {
+				continuousSuccessCount = 0
+				breakDur := microBreakDuration + time.Duration(rand.Intn(10))*time.Second
+				log.Printf("[防风控保护] 已连续正常轮询 %d 次，启动主动防疲劳微休息 %v 规避 Apple/CDN 滑动窗口配额...\n", microBreakThreshold, breakDur)
+
+				s.mu.Lock()
+				statusLabel := fmt.Sprintf("微休息(%ds)", int(breakDur.Seconds()))
+				for key, item := range s.items {
+					if item.Status != StatusInStock {
+						s.updateStatusLocked(key, statusLabel)
+					}
+				}
+				s.updateLogStrLocked()
+				s.mu.Unlock()
+
+				time.Sleep(breakDur)
+
+				// 检查休眠后是否仍处于运行状态
+				statsAfter, okAfter := s.Status.Get()
+				if okAfter != nil || statsAfter != Running {
+					continue
+				}
 			}
 
 			result := s.groupByStore()
@@ -311,11 +346,15 @@ func (s *listenService) Run() {
 			if result.blocked {
 				resetShopSession()
 				consecutiveBlocks++
-				backoff := baseBlockedBackoff * time.Duration(consecutiveBlocks)
+				continuousSuccessCount = 0
+				warmupRoundsLeft = warmupProbationRounds
+
+				jitter := time.Duration(rand.Intn(20)) * time.Second
+				backoff := baseBlockedBackoff*time.Duration(consecutiveBlocks) + jitter
 				if backoff > maxBlockedBackoff {
 					backoff = maxBlockedBackoff
 				}
-				log.Printf("[风控拦截] Apple/CDN 频率限制 (541), 正在进入冷却等待 %v (第 %d 次重试)... CDN 解禁窗口需 >120 秒\n", backoff, consecutiveBlocks)
+				log.Printf("[风控拦截] Apple/CDN 频率限制 (541), 正在进入精准冷却等待 %v (第 %d 次重试)... 真实解禁窗口通常需 180~240 秒\n", backoff, consecutiveBlocks)
 
 				s.mu.Lock()
 				statusLabel := fmt.Sprintf("风控冷却(%ds)", int(backoff.Seconds()))
@@ -331,12 +370,30 @@ func (s *listenService) Run() {
 				continue
 			}
 
-			// 正常成功，重置连续限流计数
-			consecutiveBlocks = 0
+			// 正常成功：若此前经历过限流，打印解封并进入保护期
+			if consecutiveBlocks > 0 {
+				log.Printf("[风控解除] Apple/CDN 封禁已恢复，进入解封回温保护期 (前 %d 轮降频防止瞬间反弹)\n", warmupProbationRounds)
+				consecutiveBlocks = 0
+			}
+			continuousSuccessCount++
 
-			// 轮询间隔休眠，附加 0~500ms 随机抖动打破固定周期特征
-			jitter := time.Duration(rand.Intn(500)) * time.Millisecond
-			time.Sleep(s.IntervalDuration() + jitter)
+			// 轮询间隔休眠
+			if warmupRoundsLeft > 0 {
+				warmupRoundsLeft--
+				warmupDur := warmupInterval + time.Duration(rand.Intn(10))*time.Second
+				log.Printf("[回温保护] 当前为解封回温期 (剩余 %d 轮), 本轮保护间隔 %v...\n", warmupRoundsLeft, warmupDur)
+				time.Sleep(warmupDur)
+			} else {
+				// 正常轮询：基准间隔附加 ±25% 动态随机扰动，打破固定周期机器指纹
+				baseDur := s.IntervalDuration()
+				minDur := time.Duration(float64(baseDur) * 0.75)
+				jitterRange := int64(float64(baseDur) * 0.50)
+				if jitterRange < 1 {
+					jitterRange = 1
+				}
+				sleepDur := minDur + time.Duration(rand.Int63n(jitterRange))
+				time.Sleep(sleepDur)
+			}
 		}
 	}()
 }
@@ -621,12 +678,9 @@ func (s *listenService) fetchLocation(location string, skUrl string, referer str
 	warmupShopPage(referer, s.Area.AcceptLanguage())
 
 	resp, err := shopHTTP().R().
-		SetHeader("accept", "application/json, text/javascript, */*; q=0.01").
+		SetHeader("accept", "*/*").
 		SetHeader("accept-language", s.Area.AcceptLanguage()).
-		SetHeader("cache-control", "no-cache").
-		SetHeader("pragma", "no-cache").
 		SetHeader("referer", referer).
-		SetHeader("x-requested-with", "XMLHttpRequest").
 		SetHeader("sec-fetch-dest", "empty").
 		SetHeader("sec-fetch-mode", "cors").
 		SetHeader("sec-fetch-site", "same-origin").
@@ -701,12 +755,9 @@ func (s *listenService) fetchSku(storeNumber string, skUrl string, referer strin
 	warmupShopPage(referer, s.Area.AcceptLanguage())
 
 	resp, err := shopHTTP().R().
-		SetHeader("accept", "application/json, text/javascript, */*; q=0.01").
+		SetHeader("accept", "*/*").
 		SetHeader("accept-language", s.Area.AcceptLanguage()).
-		SetHeader("cache-control", "no-cache").
-		SetHeader("pragma", "no-cache").
 		SetHeader("referer", referer).
-		SetHeader("x-requested-with", "XMLHttpRequest").
 		SetHeader("sec-fetch-dest", "empty").
 		SetHeader("sec-fetch-mode", "cors").
 		SetHeader("sec-fetch-site", "same-origin").

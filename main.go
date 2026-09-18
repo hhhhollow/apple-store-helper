@@ -49,6 +49,13 @@ func main() {
 	})
 	barkLevelWidget.SetSelected(services.BarkLevelOptions[0].Label)
 
+	// 网络代理设置输入框 (Proxy Setting Entry)
+	proxyWidget := widget.NewEntry()
+	proxyWidget.SetPlaceHolder("可选: http://127.0.0.1:7897 或 socks5://127.0.0.1:7897 (留空直连)")
+	proxyWidget.OnChanged = func(val string) {
+		services.SetCustomProxy(val)
+	}
+
 	// 查询频率选择器 (Polling Interval Selector)
 	intervalWidget := widget.NewSelect(services.IntervalLabels(), func(val string) {
 		services.Listen.IntervalSeconds.Set(services.ParseIntervalLabel(val))
@@ -76,10 +83,11 @@ func main() {
 
 	help := `1. 在 Apple 官网将需要购买的型号加入购物车
 2. 选择地区、门店和型号，点击“添加”按钮，将需要监听的型号添加到监听列表
-3. 点击“开始”按钮开始监听，检测到有货时会自动打开购物车页面
+3. 如遇到 541 频率拦截，可填入本地代理端口 (如 http://127.0.0.1:7897) 瞬间换 IP 畅快监听
+4. 点击“开始”按钮开始监听，检测到有货时会自动打开购物车页面
 `
 
-	loadUserSettingsCache(areaWidget, storeWidget, productWidget, barkWidget, barkLevelWidget, intervalWidget)
+	loadUserSettingsCache(areaWidget, storeWidget, productWidget, barkWidget, barkLevelWidget, proxyWidget, intervalWidget)
 
 	// 初始化 GUI 窗口内容 (Initialize GUI)
 	view.Window.SetContent(container.NewVBox(
@@ -88,11 +96,12 @@ func main() {
 		container.New(layout.NewFormLayout(), widget.NewLabel("选择门店:"), storeWidget),
 		container.New(layout.NewFormLayout(), widget.NewLabel("选择型号:"), productWidget),
 		container.New(layout.NewFormLayout(), widget.NewLabel("查询频率:"), intervalWidget),
+		container.New(layout.NewFormLayout(), widget.NewLabel("网络代理:"), proxyWidget),
 		container.New(layout.NewFormLayout(), widget.NewLabel("Bark 通知地址:"), barkWidget),
 		container.New(layout.NewFormLayout(), widget.NewLabel("Bark 提醒级别:"), barkLevelWidget),
 
 		container.NewBorder(nil, nil,
-			createActionButtons(areaWidget, storeWidget, productWidget, barkWidget, barkLevelWidget, intervalWidget),
+			createActionButtons(areaWidget, storeWidget, productWidget, barkWidget, barkLevelWidget, proxyWidget, intervalWidget),
 			createControlButtons(),
 		),
 
@@ -121,7 +130,7 @@ func initFyneApp() {
 }
 
 // 加载用户设置缓存 (Load user settings cache)
-func loadUserSettingsCache(areaWidget *widget.RadioGroup, storeWidget *widget.Select, productWidget *widget.Select, barkNotifyWidget *widget.Entry, barkLevelWidget *widget.Select, intervalWidget *widget.Select) {
+func loadUserSettingsCache(areaWidget *widget.RadioGroup, storeWidget *widget.Select, productWidget *widget.Select, barkNotifyWidget *widget.Entry, barkLevelWidget *widget.Select, proxyWidget *widget.Entry, intervalWidget *widget.Select) {
 	settings, err := services.LoadSettings()
 	interval := services.DefaultIntervalSeconds
 	if err == nil {
@@ -137,6 +146,10 @@ func loadUserSettingsCache(areaWidget *widget.RadioGroup, storeWidget *widget.Se
 		} else {
 			barkLevelWidget.SetSelected(services.BarkLevelOptions[0].Label)
 			services.Listen.BarkLevel = services.BarkLevelOptions[0].Label
+		}
+		if settings.ProxyURL != "" {
+			proxyWidget.SetText(settings.ProxyURL)
+			services.SetCustomProxy(settings.ProxyURL)
 		}
 		if settings.ListenInterval >= 5 {
 			interval = settings.ListenInterval
@@ -154,19 +167,21 @@ func loadUserSettingsCache(areaWidget *widget.RadioGroup, storeWidget *widget.Se
 }
 
 // 创建动作按钮 (Create action buttons)
-func createActionButtons(areaWidget *widget.RadioGroup, storeWidget *widget.Select, productWidget *widget.Select, barkNotifyWidget *widget.Entry, barkLevelWidget *widget.Select, intervalWidget *widget.Select) *fyne.Container {
+func createActionButtons(areaWidget *widget.RadioGroup, storeWidget *widget.Select, productWidget *widget.Select, barkNotifyWidget *widget.Entry, barkLevelWidget *widget.Select, proxyWidget *widget.Entry, intervalWidget *widget.Select) *fyne.Container {
 	return container.NewHBox(
 		widget.NewButton("添加", func() {
 			if storeWidget.Selected == "" || productWidget.Selected == "" {
 				dialog.ShowError(errors.New("请选择门店和型号"), view.Window)
 			} else {
 				services.Listen.Add(areaWidget.Selected, storeWidget.Selected, productWidget.Selected, barkNotifyWidget.Text, barkLevelWidget.Selected)
+				services.SetCustomProxy(proxyWidget.Text)
 				services.SaveSettings(services.UserSettings{
 					SelectedArea:    areaWidget.Selected,
 					SelectedStore:   storeWidget.Selected,
 					SelectedProduct: productWidget.Selected,
 					BarkNotifyUrl:   barkNotifyWidget.Text,
 					BarkLevel:       barkLevelWidget.Selected,
+					ProxyURL:        proxyWidget.Text,
 					ListenInterval:  services.ParseIntervalLabel(intervalWidget.Selected),
 					ListenItems:     services.Listen.GetListenItems(),
 				})
@@ -175,6 +190,21 @@ func createActionButtons(areaWidget *widget.RadioGroup, storeWidget *widget.Sele
 		widget.NewButton("清空", func() {
 			services.Listen.Clean()
 			services.ClearSettings()
+		}),
+		widget.NewButton("测试代理", func() {
+			proxyText := strings.TrimSpace(proxyWidget.Text)
+			if proxyText == "" {
+				dialog.ShowInformation("提示", "当前未配置代理 (将使用系统/直连网络)", view.Window)
+				return
+			}
+			go func() {
+				err := services.TestProxyConnection(proxyText)
+				if err != nil {
+					dialog.ShowError(err, view.Window)
+				} else {
+					dialog.ShowInformation("代理可用", fmt.Sprintf("代理 %s 连接 Apple Store 成功 (HTTP 200)！", proxyText), view.Window)
+				}
+			}()
 		}),
 		widget.NewButton("试听(有货提示音)", func() {
 			go services.Listen.AlertMp3()

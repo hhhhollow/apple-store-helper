@@ -11,6 +11,7 @@ type UserSettings struct {
 	SelectedProduct string                `json:"selected_product"`
 	BarkNotifyUrl   string                `json:"bark_notify_url"`
 	BarkLevel       string                `json:"bark_level"`
+	ProxyURL        string                `json:"proxy_url"`
 	ListenInterval  int                   `json:"listen_interval"`
 	ListenItems     map[string]ListenItem `json:"listen_items"`
 }

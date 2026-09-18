@@ -1,7 +1,10 @@
 package services
 
 import (
+	"fmt"
 	"net/http"
+	"net/http/cookiejar"
+	"strings"
 	"sync"
 	"time"
 
@@ -9,16 +12,50 @@ import (
 )
 
 var (
-	appleClientMu sync.RWMutex
-	appleHTTP     *req.Client
+	appleClientMu  sync.RWMutex
+	appleHTTP      *req.Client
+	customProxyURL string
 )
 
-func newAppleClient() *req.Client {
-	return req.C().
+// SetCustomProxy 设置并应用用户自定义网络代理 (支持 http:// 或 socks5://)。
+func SetCustomProxy(rawProxy string) {
+	rawProxy = strings.TrimSpace(rawProxy)
+	appleClientMu.Lock()
+	if customProxyURL == rawProxy {
+		appleClientMu.Unlock()
+		return
+	}
+	customProxyURL = rawProxy
+	if appleHTTP != nil {
+		if hc := appleHTTP.GetClient(); hc != nil {
+			hc.CloseIdleConnections()
+		}
+	}
+	appleHTTP = newAppleClient(customProxyURL)
+	appleClientMu.Unlock()
+}
+
+// GetCustomProxy 获取当前配置的代理地址。
+func GetCustomProxy() string {
+	appleClientMu.RLock()
+	defer appleClientMu.RUnlock()
+	return customProxyURL
+}
+
+func newAppleClient(proxy string) *req.Client {
+	jar, _ := cookiejar.New(nil)
+	c := req.C().
 		ImpersonateChrome().
-		SetCookieJar(nil).
-		SetProxy(http.ProxyFromEnvironment).
+		SetCookieJar(jar).
 		SetTimeout(15 * time.Second)
+
+	if proxy != "" {
+		c.SetProxyURL(proxy)
+	} else {
+		c.SetProxy(http.ProxyFromEnvironment)
+	}
+
+	return c
 }
 
 func shopHTTP() *req.Client {
@@ -34,19 +71,15 @@ func shopHTTP() *req.Client {
 	if appleHTTP != nil {
 		return appleHTTP
 	}
-	appleHTTP = newAppleClient()
+	appleHTTP = newAppleClient(customProxyURL)
 	return appleHTTP
 }
 
 // warmupShopPage 保持为空操作。
-// 此前访问 /shop/buy-iphone 会获取 Akamai 追踪令牌 (shld_bt_m / dssid2)，
-// 累积请求后会被 Akamai 标记为爬虫导致 541 风控且长时间无法解封。
-// 库存查询接口 /shop/retail/pickup-message 本身是公开无状态的，不带 Cookie 查询更安全持久。
 func warmupShopPage(pageURL, acceptLanguage string) {
 }
 
-// resetShopSession 重置 HTTP 客户端并强制断开所有已建立的连接与会话。
-// 避免因复用被标记的 TCP 连接或边缘节点缓存而持续处于 541 拦截状态。
+// resetShopSession 重置 HTTP 客户端并强制断开所有已建立的连接与旧会话。
 func resetShopSession() {
 	appleClientMu.Lock()
 	defer appleClientMu.Unlock()
@@ -55,5 +88,37 @@ func resetShopSession() {
 			hc.CloseIdleConnections()
 		}
 	}
-	appleHTTP = newAppleClient()
+	appleHTTP = newAppleClient(customProxyURL)
 }
+
+// TestProxyConnection 测试指定代理的连通性与可用性。
+func TestProxyConnection(proxy string) error {
+	proxy = strings.TrimSpace(proxy)
+	client := req.C().
+		ImpersonateChrome().
+		SetTimeout(10 * time.Second)
+
+	if proxy != "" {
+		client.SetProxyURL(proxy)
+	} else {
+		client.SetProxy(http.ProxyFromEnvironment)
+	}
+
+	resp, err := client.R().
+		SetHeader("accept", "*/*").
+		SetHeader("accept-language", "zh-CN,zh-Hans;q=0.9").
+		SetHeader("referer", "https://www.apple.com.cn/shop/buy-iphone").
+		Get("https://www.apple.com.cn/shop/retail/pickup-message?pl=true&parts.0=MJY94CH/A&location=100000")
+
+	if err != nil {
+		return fmt.Errorf("代理连接失败: %w", err)
+	}
+	if resp.GetStatusCode() == 541 {
+		return fmt.Errorf("该代理当前已被 Apple/CDN 封禁(541)，请更换其他节点")
+	}
+	if resp.GetStatusCode() != 200 {
+		return fmt.Errorf("HTTP 状态码异常: %d", resp.GetStatusCode())
+	}
+	return nil
+}
+

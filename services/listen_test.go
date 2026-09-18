@@ -168,24 +168,58 @@ func TestAllStoresInStockSimulation(t *testing.T) {
 }
 
 func TestShopClientSession(t *testing.T) {
-	resp, err := shopHTTP().R().Get("https://www.apple.com.cn/shop/retail/pickup-message?pl=true&parts.0=MJY94CH/A&location=100000")
-	if err != nil {
-		t.Fatalf("err: %v", err)
-	}
-	if resp.GetStatusCode() != 200 {
-		t.Fatalf("expected 200, got %d", resp.GetStatusCode())
-	}
-	t.Logf("Stateless request successful: status %d, len %d", resp.GetStatusCode(), len(resp.String()))
+	requestCount := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requestCount++
+		if requestCount == 1 {
+			http.SetCookie(w, &http.Cookie{Name: "shld_bt_m", Value: "token123", Path: "/"})
+			w.WriteHeader(http.StatusOK)
+			w.Write([]byte(`{"status":"ok"}`))
+			return
+		}
 
+		// 第二次请求：验证是否携带了第一次收到的 Cookie
+		cookie, err := r.Cookie("shld_bt_m")
+		if err != nil || cookie.Value != "token123" {
+			t.Errorf("expected cookie shld_bt_m=token123, got %v, err=%v", cookie, err)
+		}
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status":"ok_with_cookie"}`))
+	}))
+	defer server.Close()
+
+	client := shopHTTP()
+	resp1, err := client.R().Get(server.URL)
+	if err != nil || resp1.GetStatusCode() != 200 {
+		t.Fatalf("first request failed: %v", err)
+	}
+
+	resp2, err := client.R().Get(server.URL)
+	if err != nil || resp2.GetStatusCode() != 200 {
+		t.Fatalf("second request failed: %v", err)
+	}
+
+	// 验证 resetShopSession 会刷新客户端
 	resetShopSession()
-	resp2, err := shopHTTP().R().Get("https://www.apple.com.cn/shop/retail/pickup-message?pl=true&parts.0=MJY94CH/A&location=100000")
-	if err != nil {
-		t.Fatalf("err after reset: %v", err)
+	newClient := shopHTTP()
+	if newClient == nil {
+		t.Fatalf("expected non-nil client after reset")
 	}
-	if resp2.GetStatusCode() != 200 {
-		t.Fatalf("expected 200 after reset, got %d", resp2.GetStatusCode())
+}
+
+func TestProxyConfiguration(t *testing.T) {
+	orig := GetCustomProxy()
+	defer SetCustomProxy(orig)
+
+	SetCustomProxy("http://127.0.0.1:7897")
+	if GetCustomProxy() != "http://127.0.0.1:7897" {
+		t.Fatalf("expected http://127.0.0.1:7897, got %s", GetCustomProxy())
 	}
-	t.Logf("Post-reset request successful: status %d, len %d", resp2.GetStatusCode(), len(resp2.String()))
+
+	SetCustomProxy("")
+	if GetCustomProxy() != "" {
+		t.Fatalf("expected empty proxy, got %s", GetCustomProxy())
+	}
 }
 
 func TestFormatBarkEndpoint(t *testing.T) {
